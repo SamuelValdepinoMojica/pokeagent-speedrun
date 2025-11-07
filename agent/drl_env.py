@@ -11,7 +11,6 @@ from typing import Optional, Tuple, Dict, Any
 
 from pokemon_env.emulator import EmeraldEmulator
 from agent.lightweight_state_reader import LightweightStateReader
-from paddleocr import PaddleOCR
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +63,6 @@ class PokemonEmeraldEnv(gym.Env):
         self.frame_skip = frame_skip
         self.turbo_mode = turbo_mode
         self.state_read_interval = state_read_interval
-        
-        # Initialize OCR
-        logger.info("Initializing PaddleOCR...")
-        self.ocr = PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False)
-        logger.info("PaddleOCR initialized successfully")
         
         # Initialize emulator
         logger.info(f"Initializing emulator with ROM: {rom_path}")
@@ -244,22 +238,6 @@ class PokemonEmeraldEnv(gym.Env):
         # Update previous state
         self.prev_game_state = lightweight_state
         
-        # Check for text every 100 steps
-        if self.current_step % 10 == 0:
-            # Get screenshot for OCR
-            screenshot = self.emulator.get_screenshot()
-            if screenshot:
-                # Convert PIL Image to numpy array if needed
-                img_array = np.array(screenshot)
-                # Run OCR
-                response = self.ocr.predict(img_array)
-                
-                text_list = response[0]['rec_texts']
-                
-                extracted_text = ' '.join(text_list)
-                
-                logger.error(f"📝 OCR Text at step {self.current_step}: {extracted_text}")
-                    
         return observation, reward, terminated, truncated, info
     
     def _extract_observation(self, game_state: Dict[str, Any]) -> Dict[str, np.ndarray]:
