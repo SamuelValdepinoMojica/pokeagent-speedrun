@@ -58,6 +58,7 @@ def compare_states():
     import time
     start = time.time()
     comprehensive = emulator.get_comprehensive_state()
+    print( format_dict(comprehensive) , comprehensive)
     comp_time = (time.time() - start) * 1000
     
     print(f"⏱️  Read time: {comp_time:.2f}ms\n")

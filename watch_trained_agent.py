@@ -185,7 +185,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, help="Path to trained model (.zip)")
     parser.add_argument("--state", type=str, default="Emerald-GBAdvance/quick_start_save.state",
                        help="Initial game state")
-    parser.add_argument("--steps", type=int, default=10000, help="Number of steps to watch")
+    parser.add_argument("--steps", type=int, default=20000, help="Number of steps to watch")
     parser.add_argument("--random", action="store_true", help="Use random actions instead of model")
     
     args = parser.parse_args()

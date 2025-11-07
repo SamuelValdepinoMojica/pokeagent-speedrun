@@ -44,7 +44,8 @@ class LightweightStateReader:
             "map_tiles": None,
             "party": [],
             "badges": 0,
-            "in_battle": False
+            "in_battle": False,
+            "milestone_count": 0  # 🆕 Agregar contador de milestones
         }
         
         try:
@@ -53,31 +54,70 @@ class LightweightStateReader:
             state["position"] = {"x": coords[0], "y": coords[1]}
             
             # 2. Map tiles - read smaller radius for speed
-            tiles = self.mem.read_map_around_player(radius=map_radius)
-            if tiles:
-                state["map_tiles"] = tiles
+            # CRITICAL: Validate map buffer before accessing to prevent segfault
+            # Check if map buffer is valid and dimensions are reasonable
+            map_buffer_valid = False
+            if (hasattr(self.mem, '_map_buffer_addr') and 
+                self.mem._map_buffer_addr and 
+                hasattr(self.mem, '_map_width') and 
+                hasattr(self.mem, '_map_height')):
+                # Check dimensions are reasonable (not 0 or corrupted)
+                if (self.mem._map_width > 0 and 
+                    self.mem._map_height > 0 and 
+                    self.mem._map_width < 500 and 
+                    self.mem._map_height < 500):
+                    map_buffer_valid = True
+            
+            # Only try to read map if buffer is valid
+            if map_buffer_valid:
+                try:
+                    tiles = self.mem.read_map_around_player(radius=map_radius)
+                    if tiles:
+                        state["map_tiles"] = tiles
+                except:
+                    # Map read failed, leave as None
+                    pass
             
             # 3. Party Pokemon - minimal info only
-            party = self.mem.read_party_pokemon()
-            if party:
-                state["party"] = [
-                    {
-                        "species_name": pokemon.species_name,
-                        "level": pokemon.level,
-                        "current_hp": pokemon.current_hp,
-                        "max_hp": pokemon.max_hp,
-                        "status": pokemon.status.get_status_name() if pokemon.status else "OK"
-                    }
-                    for pokemon in party[:3]  # Only first 3 Pokemon for speed
-                ]
+            try:
+                party = self.mem.read_party_pokemon()
+                if party:
+                    state["party"] = [
+                        {
+                            "species_name": pokemon.species_name,
+                            "level": pokemon.level,
+                            "current_hp": pokemon.current_hp,
+                            "max_hp": pokemon.max_hp,
+                            "status": pokemon.status.get_status_name() if pokemon.status else "OK"
+                        }
+                        for pokemon in party[:3]  # Only first 3 Pokemon for speed
+                    ]
+            except:
+                pass
             
             # 4. Badges - just count
-            badges = self.mem.read_badges()
-            if badges:
-                state["badges"] = len(badges)
+            try:
+                badges = self.mem.read_badges()
+                if badges:
+                    state["badges"] = len(badges)
+            except:
+                pass
             
             # 5. Battle flag - quick check
-            state["in_battle"] = self.mem.is_in_battle()
+            try:
+                state["in_battle"] = self.mem.is_in_battle()
+            except:
+                pass
+            
+            # 6. Milestone count - cuántos hitos completados (🆕)
+            try:
+                # Acceder al milestone_tracker del emulator si existe
+                if (hasattr(self.mem, 'core') and 
+                    hasattr(self.mem.core, 'milestone_tracker')):
+                    milestone_tracker = self.mem.core.milestone_tracker
+                    state["milestone_count"] = len(milestone_tracker.milestones)
+            except:
+                pass
             
         except Exception as e:
             # Fail silently, return partial state
@@ -92,7 +132,7 @@ class LightweightStateReader:
         Returns:
             Dict with:
                 - 'map': ndarray of shape (map_size, map_size, 3) - normalized [0, 1]
-                - 'vector': ndarray of shape (18,) - normalized features
+                - 'vector': ndarray of shape (19,) - normalized features (incluye milestone_count)
         """
         state = self.get_drl_state(map_radius=map_radius)
         
@@ -115,8 +155,8 @@ class LightweightStateReader:
                             map_array[i, j, 1] = min(behavior / 255.0, 1.0)  # Behavior
                             map_array[i, j, 2] = 1.0 if collision else 0.0    # Collision
         
-        # Initialize vector features (18 elements)
-        vector = np.zeros(18, dtype=np.float32)
+        # Initialize vector features (19 elements - aumentado para milestone_count)
+        vector = np.zeros(19, dtype=np.float32)
         
         # Position (2 features)
         if state["position"]:
@@ -137,11 +177,12 @@ class LightweightStateReader:
             # Status (0 = OK, 1 = not OK)
             vector[idx + 3] = 0.0 if pokemon.get("status") == "OK" else 1.0
         
-        # Game state features (4 features)
+        # Game state features (5 features - agregado milestone_count)
         vector[14] = state["badges"] / 8.0  # Badges count (0-8)
         vector[15] = 1.0 if state["in_battle"] else 0.0
-        vector[16] = 0.0  # Reserved
+        vector[16] = state.get("milestone_count", 0) / 100.0  # 🆕 Milestone count (0-100 normalizado)
         vector[17] = 0.0  # Reserved
+        vector[18] = 0.0  # Reserved
         
         return {
             "map": map_array,

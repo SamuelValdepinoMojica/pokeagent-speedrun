@@ -70,7 +70,7 @@ class PokemonEmeraldEnv(gym.Env):
         self.emulator.initialize()
         logger.info("Emulator initialized successfully")
         
-        # Initialize lightweight state reader for fast observations
+                # Initialize lightweight state reader for fast observations
         logger.info("Initializing lightweight state reader for DRL...")
         self.state_reader = LightweightStateReader(self.emulator.memory_reader)
         logger.info("Lightweight reader ready")
@@ -88,24 +88,23 @@ class PokemonEmeraldEnv(gym.Env):
         self.initial_game_state = self.emulator.get_comprehensive_state()
         logger.info(f"Initial game state cached")
         
-        # Action space: 8 GBA buttons
-        # 0=A, 1=B, 2=SELECT, 3=START, 4=RIGHT, 5=LEFT, 6=UP, 7=DOWN
-        self.action_space = spaces.Discrete(8)
+        # Action space: 7 GBA buttons (START removed to prevent save menu crash)
+        # 0=A, 1=B, 2=SELECT, 3=RIGHT, 4=LEFT, 5=UP, 6=DOWN
+        self.action_space = spaces.Discrete(6)
         
         self._action_map = {
             0: "a",
             1: "b", 
-            2: "select",
-            3: "start",
-            4: "right",
-            5: "left",
-            6: "up",
-            7: "down"
+            #2: "select",
+            2: "right",
+            3: "left",
+            4: "up",
+            5: "down"
         }
         
         # Observation space: Dictionary with map image and game state vector
         # Map: 7x7x3 channels (metatile_id, collision, behavior) - for CNN
-        # Vector: player position (2) + party info (12) + game state (4) = 18 features
+        # Vector: player position (2) + party info (12) + game state (4) + milestone_count (1) = 19 features
         self.observation_space = spaces.Dict({
             'map': spaces.Box(
                 low=0,
@@ -116,7 +115,7 @@ class PokemonEmeraldEnv(gym.Env):
             'vector': spaces.Box(
                 low=-1.0,
                 high=1.0,
-                shape=(18,),
+                shape=(19,),  # Aumentado de 18 a 19 para milestone_count
                 dtype=np.float32
             )
         })
@@ -132,6 +131,21 @@ class PokemonEmeraldEnv(gym.Env):
         self.visited_locations = set()
         self.prev_position = None
         self.stationary_steps = 0
+        
+        # LLM reward shaping (GLOBAL VARIABLES approach)
+        self.llm_reward_multiplier = 1.0  # LLM modifies this (0.0 to 2.0)
+        self.llm_advice = ""  # Current strategic advice from LLM
+        self.llm_last_update_step = 0  # Last step when LLM was consulted
+        self.last_milestone_count = 0  # Track milestone progress for LLM
+        
+        # 🆕 Caché de diálogos (para capturar texto cuando aparece)
+        self.last_dialog = ""  # Último diálogo detectado
+        self.last_dialog_step = 0  # Step cuando se detectó
+        self.dialog_cache_duration = 500  # Mantener diálogo por 500 steps
+        
+        # Directional reward shaping (PROXIMITY-BASED)
+        self.directional_multiplier = 1.0  # Based on distance to objectives
+        self.directional_advice = ""  # Direction guidance
         
         logger.info(f"Environment created - Action space: {self.action_space}, Observation space: {self.observation_space.shape}")
     
@@ -153,11 +167,14 @@ class PokemonEmeraldEnv(gym.Env):
         """
         super().reset(seed=seed)
         
-        # Get lightweight state for fast reset
-        logger.info(f"Resetting environment - Episode complete")
+        # RESET REAL: Cargar el estado inicial del emulador
+        logger.info(f"Resetting environment - Loading initial state: {self.initial_state_path}")
+        self.emulator.load_state(self.initial_state_path)
+        
+        # Get lightweight state DESPUÉS de resetear el emulador
         lightweight_state = self.state_reader.get_drl_state(map_radius=3)
         self.prev_game_state = lightweight_state
-        logger.info(f"Reset complete - soft reset (continuing from current position)")
+        logger.info(f"Reset complete - emulator restored to initial state")
         
         # Reset tracking variables
         logger.info("Resetting tracking variables...")
@@ -166,7 +183,13 @@ class PokemonEmeraldEnv(gym.Env):
         position = lightweight_state.get('position', {})
         self.prev_position = (position.get('x', 0), position.get('y', 0))
         self.stationary_steps = 0
-        logger.info(f"Initial position: {self.prev_position}")
+        
+        # 🆕 Limpiar caché de diálogos (pueden ser "stale" del estado guardado)
+        self.last_dialog = ""
+        self.last_dialog_step = 0
+        logger.debug("Dialog cache cleared on reset")
+        
+        logger.info(f"Initial position after reset: {self.prev_position}")
         
         # Extract observation using lightweight reader
         logger.info("Extracting observation...")
@@ -237,6 +260,11 @@ class PokemonEmeraldEnv(gym.Env):
         
         # Update previous state
         self.prev_game_state = lightweight_state
+        
+        # 🆕 Chequear y cachear diálogo en cada step (solo si hay texto)
+        # Esto es muy ligero - solo lee memoria/screenshot si es necesario
+        if self.current_step % 5 == 0:  # Chequear cada 5 steps para no sobrecargar
+            self._cache_dialog_if_present()
         
         return observation, reward, terminated, truncated, info
     
@@ -519,6 +547,28 @@ class PokemonEmeraldEnv(gym.Env):
                 elif hp_ratio < 0.5:
                     reward -= 1.0
         
+        # Apply COMBINED reward multipliers:
+        # 1. LLM multiplier (milestone-based, every 1000 steps)
+        # 2. Directional multiplier (proximity-based, every 100 steps)
+        base_reward = reward
+        
+        # Combinar ambos multiplicadores (multiplicativo)
+        combined_multiplier = self.llm_reward_multiplier * self.directional_multiplier
+        reward = reward * combined_multiplier
+        
+        # Log cuando hay reward shaping activo
+        if abs(combined_multiplier - 1.0) > 0.1 and abs(base_reward) > 0.1:
+            parts = []
+            if self.llm_reward_multiplier != 1.0:
+                parts.append(f"LLM:{self.llm_reward_multiplier:.2f}")
+            if self.directional_multiplier != 1.0:
+                parts.append(f"Dir:{self.directional_multiplier:.2f}")
+            
+            logger.warning(
+                f"💰 Reward shaping: {base_reward:.2f} → {reward:.2f} "
+                f"({' × '.join(parts) if parts else f'×{combined_multiplier:.2f}'})"
+            )
+        
         return reward
     
     def _check_terminated_from_lightweight(self, lightweight_state: Dict[str, Any]) -> bool:
@@ -557,6 +607,130 @@ class PokemonEmeraldEnv(gym.Env):
             if screenshot:
                 return np.array(screenshot)
         return None
+    
+    # Helper methods for LLM reward callback (SubprocVecEnv compatibility)
+    def _get_stationary_steps(self) -> int:
+        """Get current stationary steps count (for remote access)."""
+        return self.stationary_steps
+    
+    def _get_milestone_count(self) -> int:
+        """Get number of completed milestones (for remote access)."""
+        if hasattr(self.emulator, 'milestone_tracker'):
+            return len(self.emulator.milestone_tracker.milestones)
+        return 0
+    
+    def _get_last_milestone_count(self) -> int:
+        """Get last known milestone count (for remote access)."""
+        return self.last_milestone_count
+    
+    def _set_llm_multiplier(self, multiplier: float, advice: str, milestone_count: int):
+        """Set LLM reward multiplier and advice (for remote access)."""
+        self.llm_reward_multiplier = multiplier
+        self.llm_advice = advice
+        # Actualizar last_milestone_count para evitar boost persistente
+        self.last_milestone_count = milestone_count
+    
+    def _set_last_milestone_count(self, count: int):
+        """Update last milestone count (for remote access)."""
+        self.last_milestone_count = count
+    
+    # Helper methods for Directional reward callback (proximity-based)
+    def _get_player_position(self) -> tuple:
+        """Get current player position (x, y) for directional guidance."""
+        if hasattr(self, 'prev_game_state') and self.prev_game_state:
+            pos = self.prev_game_state.get('position', {})
+            return (pos.get('x', 0), pos.get('y', 0))
+        return (0, 0)
+    
+    def _get_current_map_name(self) -> str:
+        """Get current map name for objective detection."""
+        try:
+            # Intentar obtener del memory reader
+            if hasattr(self.emulator, 'memory_reader'):
+                map_name = self.emulator.memory_reader.get_map_name()
+                if map_name and map_name != "UNKNOWN":
+                    return map_name
+            
+            # Fallback: usar location si está disponible
+            if hasattr(self, 'prev_location') and self.prev_location:
+                return self.prev_location
+            
+            return "UNKNOWN"
+        except Exception as e:
+            logger.debug(f"Could not get map name: {e}")
+            return "UNKNOWN"
+    
+    def _cache_dialog_if_present(self):
+        """
+        🆕 Chequear si hay diálogo en pantalla y guardarlo en caché.
+        
+        Se llama cada 5 steps desde step() para capturar diálogos cuando aparecen,
+        sin depender de cuándo el LLM callback decida leerlos.
+        
+        Usa read_dialog() directo en lugar de OCR fallback para mayor velocidad.
+        """
+        try:
+            if not hasattr(self.emulator, 'memory_reader'):
+                return
+            
+            # 🆕 Ignorar diálogos "stale" en los primeros 50 steps después del reset
+            # (pueden ser diálogos viejos del estado guardado que quedaron en memoria)
+            if self.current_step < 50:
+                logger.debug(f"Ignoring potential stale dialog at step {self.current_step}")
+                return
+            
+            # Leer diálogo directo de memoria (rápido y simple)
+            dialog = self.emulator.memory_reader.read_dialog()
+            
+            # 🆕 Filtrar textos ambientales (NO son objetivos)
+            if dialog and dialog.strip():
+                dialog_lower = dialog.lower()
+                ambient_text_patterns = [
+                    "there is a movie on tv", "two men are dancing", "four boys are playing",
+                    "it's a nintendo", "game boy", "it's a poster", "it's a map",
+                    "it's a bookshelf", "there are books", "it's a clock",
+                    "it's a pc", "someone's pc", "it's a trash", "it's a plant",
+                    "the water is", "it's a beautiful", "nothing here",
+                    "took a closer look", "checked", "examined"
+                ]
+                
+                if any(pattern in dialog_lower for pattern in ambient_text_patterns):
+                    logger.debug(f"🚫 Ignoring ambient text: '{dialog[:40]}...'")
+                    return  # No cachear texto ambiental
+            
+            # Solo guardar si hay texto nuevo y diferente al anterior
+            if dialog and dialog.strip() and dialog != self.last_dialog:
+                self.last_dialog = dialog
+                self.last_dialog_step = self.current_step
+                logger.info(f"💬 [Step {self.current_step}] NEW DIALOG: '{dialog[:60]}...'")
+        except Exception as e:
+            # Log errores para saber si hay problemas
+            logger.debug(f"Error caching dialog: {e}")
+    
+    def _get_current_dialog(self) -> str:
+        """
+        Get current dialogue text from cache (for LLM callback).
+        
+        Ya NO lee directamente - solo retorna el caché actualizado por _cache_dialog_if_present().
+        El caché se actualiza cada 5 steps en step(), capturando diálogos cuando aparecen.
+        """
+        steps_since_dialog = self.current_step - self.last_dialog_step
+        
+        if self.last_dialog and steps_since_dialog < self.dialog_cache_duration:
+            logger.debug(f"Returning cached dialog from {steps_since_dialog} steps ago")
+            return self.last_dialog
+        else:
+            logger.debug(f"No valid dialog in cache")
+            return ""
+    
+    def _set_directional_multiplier(self, multiplier: float, advice: str):
+        """Set directional reward multiplier based on proximity to objectives."""
+        self.directional_multiplier = multiplier
+        self.directional_advice = advice
+    
+    def close(self):
+        """Clean up resources."""
+        self.emulator.stop()
     
     def close(self):
         """Clean up resources."""

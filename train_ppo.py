@@ -13,6 +13,7 @@ from stable_baselines3.common.monitor import Monitor
 
 from agent.drl_env import PokemonEmeraldEnv
 from agent.cnn_policy import PokemonCNNPolicy
+from agent.llm_reward_callback import LLMRewardCallback
 
 # Setup logging
 # Use WARNING during training to reduce terminal spam
@@ -192,7 +193,9 @@ def train_ppo(
     log_dir: str = "./logs",
     tensorboard_log: str = "./tensorboard_logs",
     n_envs: int = 1,  # Number of parallel environments
-    visualize: bool = False  # If True, show pygame window (only works with n_envs=1)
+    visualize: bool = False,  # If True, show pygame window (only works with n_envs=1)
+    use_llm: bool = False,  # 🆕 Enable LLM-based reward shaping
+    pure_drl: bool = False  # 🆕 Pure DRL mode (no reward shaping at all)
 ):
     """
     Train a PPO agent on Pokemon Emerald.
@@ -207,11 +210,18 @@ def train_ppo(
         tensorboard_log: Directory for tensorboard logs
         n_envs: Number of parallel environments (more = faster training)
         visualize: Show pygame window during training (only works with n_envs=1)
+        use_llm: Enable LLM-based reward shaping with dialogue reading
+        pure_drl: Pure DRL mode - disable ALL reward shaping callbacks
     """
     # Validate visualize mode
     if visualize and n_envs > 1:
         logger.warning("⚠️  visualize=True only works with n_envs=1. Setting n_envs=1.")
         n_envs = 1
+    
+    # Validate conflicting flags
+    if use_llm and pure_drl:
+        logger.warning("⚠️  Cannot use --use-llm and --pure-drl together. Using --pure-drl (no reward shaping).")
+        use_llm = False
     
     # Create directories
     os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
@@ -226,16 +236,31 @@ def train_ppo(
     logger.info(f"Parallel Environments: {n_envs}")
     logger.info(f"Total Timesteps: {total_timesteps:,}")
     logger.info(f"Save Frequency: {save_freq:,}")
+    
+    # 🆕 Mostrar modo de entrenamiento
+    if pure_drl:
+        logger.info(f"Training Mode: 🔵 PURE DRL (no reward shaping)")
+    elif use_llm:
+        logger.info(f"Training Mode: 🤖 LLM + Dialogue-based reward shaping")
+    else:
+        logger.info(f"Training Mode: 📊 Rule-based milestone reward shaping")
+    
     logger.info("=" * 60)
     
     # Create environment(s) - multiple for faster training
     logger.info(f"Creating {n_envs} parallel environment(s)...")
     
-    # IMPORTANT: Use DummyVecEnv for stability with mGBA emulator
-    # SubprocVecEnv can cause EOFError crashes with multiple emulator instances
-    logger.info("Using DummyVecEnv (single process, more stable)")
-    env_fns = [make_env(rom_path, initial_state_path, rank=i, visualize=(visualize and i == 0)) for i in range(n_envs)]
-    env = DummyVecEnv(env_fns)
+    # Use SubprocVecEnv for TRUE parallel execution (each env in separate process)
+    # Note: With START button removed, save crashes should be eliminated
+    if n_envs > 1:
+        logger.info(f"Using SubprocVecEnv ({n_envs} processes, TRUE parallel)")
+        env_fns = [make_env(rom_path, initial_state_path, rank=i, visualize=(visualize and i == 0)) for i in range(n_envs)]
+        env = SubprocVecEnv(env_fns, start_method='spawn')  # spawn method is safer than fork for mGBA
+    else:
+        logger.info("Using DummyVecEnv (single environment)")
+        env_fns = [make_env(rom_path, initial_state_path, rank=0, visualize=visualize)]
+        env = DummyVecEnv(env_fns)
+    
     env = VecMonitor(env, log_dir)
     
     # Create callbacks
@@ -251,7 +276,43 @@ def train_ppo(
     )
     callbacks.append(checkpoint_callback)
     
+    # 🆕 REWARD SHAPING CALLBACKS - Configurables según modo
+    if not pure_drl:
+        # LLM reward shaping callback
+        llm_callback = LLMRewardCallback(
+            check_frequency=500,  # Check every 500 steps para análisis LLM
+            use_llm=use_llm,  # Usar LLM si --use-llm está activo
+            llm_timeout=60,  # 🆕 Timeout de 60 segundos para LLM (era 15s)
+            verbose=1
+        )
+        callbacks.append(llm_callback)
+        
+        if use_llm:
+            logger.info("✅ LLM reward shaping enabled (DIALOGUE-BASED MODE - reads game text!)")
+        else:
+            logger.info("✅ LLM reward shaping enabled (RULE-BASED MODE - milestone detection)")
+    else:
+        logger.info("🔵 Pure DRL mode - ALL reward shaping disabled")
+    
+    # Directional reward shaping callback (proximity-based) - DESACTIVADO PARA PRUEBA
+    # Recompensa progresivamente cuando el agente se acerca a objetivos
+    # Más frecuente que LLM (cada 100 steps) para guiar continuamente
+    # NOTA: Desactivado temporalmente para probar DRL puro sin reward shaping direccional
+    """
+    from agent.directional_reward_callback import DirectionalRewardCallback
+    directional_callback = DirectionalRewardCallback(
+        check_frequency=100,  # Check every 100 steps (más frecuente que LLM)
+        proximity_boost=1.5,  # 1.5× reward cuando se acerca a objetivos
+        proximity_penalty=0.8,  # 0.8× reward cuando se aleja
+        verbose=1
+    )
+    callbacks.append(directional_callback)
+    logger.info("🧭 Directional reward shaping enabled (proximity-based guidance)")
+    """
+    logger.info("⚠️  Directional reward shaping DISABLED - Testing pure DRL learning")
+    
     # Pygame visualization callback (only if visualize=True)
+
     if visualize:
         logger.info("🎮 Enabling pygame visualization...")
         render_callback = PygameRenderCallback(
@@ -410,6 +471,10 @@ if __name__ == "__main__":
                         help="Number of parallel environments (recommended: 1-4 for DummyVecEnv)")
     parser.add_argument("--visualize", action="store_true",
                         help="Show pygame window during training (only works with --n-envs 1)")
+    parser.add_argument("--use-llm", action="store_true",
+                        help="Enable LLM-based reward shaping with dialogue reading (requires Ollama)")
+    parser.add_argument("--pure-drl", action="store_true",
+                        help="Pure DRL mode: disable ALL reward shaping (no milestones, no LLM)")
     
     args = parser.parse_args()
     
@@ -421,7 +486,9 @@ if __name__ == "__main__":
             save_freq=args.save_freq,
             model_save_path=args.model_path,
             n_envs=args.n_envs,
-            visualize=args.visualize
+            visualize=args.visualize,
+            use_llm=args.use_llm,
+            pure_drl=args.pure_drl
         )
     else:
         test_model(
